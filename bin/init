@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+source /opt/miniconda3/bin/activate astrofusion-2
+
+export PYTHONPATH="/home/dobos/project/astrofusion/build/python:/home/dobos/project/astrofusion/python:/home/dobos/project/astrofusion/tests:$PYTHONPATH"
