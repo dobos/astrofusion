@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ::datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use ::datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -11,6 +11,7 @@ use ::datafusion::execution::context::SessionContext;
 use ::datafusion::physical_plan::memory::MemoryExec;
 use ::datafusion::physical_plan::ExecutionPlan;
 use ::datafusion::prelude::Expr;
+use ::datafusion::common::{Constraints, Statistics};
 use datafusion_expr::TableProviderFilterPushDown;
 use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -62,6 +63,33 @@ impl PythonTableProvider {
         ))
     }
 
+    /// Optional Python proxy for DataFusion's `constraints()` hook.
+    ///
+    /// This is metadata-only and is not used to perform index lookup. DataFusion
+    /// decides whether to push filters into `scan()` via `supports_filters_pushdown()`.
+    #[pyo3(name = "constraints")]
+    fn constraints_py(&self, py: Python<'_>) -> PyResult<PyObject> {
+        Ok(py.None().into_bound(py).unbind())
+    }
+
+    /// Optional Python proxy for DataFusion's `table_type()` metadata hook.
+    #[pyo3(name = "table_type")]
+    fn table_type_py(&self, _py: Python<'_>) -> PyResult<String> {
+        Ok(TableType::Base.to_string())
+    }
+
+    /// Optional Python proxy for DataFusion's `get_table_definition()` hook.
+    #[pyo3(name = "get_table_definition")]
+    fn get_table_definition_py(&self, _py: Python<'_>) -> PyResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// Optional Python proxy for DataFusion's `statistics()` hook.
+    #[pyo3(name = "statistics")]
+    fn statistics_py(&self, py: Python<'_>) -> PyResult<PyObject> {
+        Ok(py.None().into_bound(py).unbind())
+    }
+
     /// Optional callback invoked by the Rust bridge during a scan.
     ///
     /// `projection` contains selected column indices, `filters` contains the
@@ -92,11 +120,33 @@ impl PythonTableProvider {
         Ok(out)
     }
 
-    /// Optional index-lookup callback for Python-defined access patterns.
+    /// Optional key-based lookup callback for Python-side index access.
+    ///
+    /// This is not a native DataFusion trait method, but it gives Python
+    /// subclasses a hook to implement their own keyed access strategy and then
+    /// use it from `scan()` when a filter is recognized as an index hit.
     #[pyo3(name = "index_lookup")]
     fn index_lookup_py(&self, _keys: Vec<PyObject>) -> PyResult<PyObject> {
         Err(PyNotImplementedError::new_err(
             "index_lookup() must be implemented in a Python subclass of PythonTableProvider",
+        ))
+    }
+
+    /// Optional range-scan callback for Python-side indexed access.
+    ///
+    /// DataFusion's `TableProvider` trait does not define a native range-scan
+    /// method. This hook exists so Python code can implement an index-aware
+    /// `scan()` that calls `index_range_scan(start, end, column)` when it sees
+    /// range predicates such as `id >= 2 AND id <= 5`.
+    #[pyo3(name = "index_range_scan")]
+    fn index_range_scan_py(
+        &self,
+        _start: Option<PyObject>,
+        _end: Option<PyObject>,
+        _column: Option<String>,
+    ) -> PyResult<PyObject> {
+        Err(PyNotImplementedError::new_err(
+            "index_range_scan() must be implemented in a Python subclass of PythonTableProvider",
         ))
     }
 }
@@ -145,7 +195,13 @@ impl SessionContextWrapper {
 
     /// Register a Python table provider under a name so it can be queried.
     fn register_table(&self, name: &str, provider: PyObject) -> PyResult<()> {
-        let adapter = PythonTableProviderAdapter { provider };
+        let adapter = PythonTableProviderAdapter {
+            provider,
+            constraints: OnceLock::new(),
+            table_type: OnceLock::new(),
+            table_definition: OnceLock::new(),
+            statistics: OnceLock::new(),
+        };
         self.context
             .register_table(name, Arc::new(adapter))
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -165,6 +221,10 @@ impl SessionContextWrapper {
 #[derive(Debug)]
 struct PythonTableProviderAdapter {
     provider: PyObject,
+    constraints: OnceLock<Option<Constraints>>,
+    table_type: OnceLock<TableType>,
+    table_definition: OnceLock<Option<String>>,
+    statistics: OnceLock<Option<Statistics>>,
 }
 
 impl PythonTableProviderAdapter {
@@ -234,6 +294,90 @@ impl PythonTableProviderAdapter {
             })
             .collect())
     }
+
+    fn python_constraints(&self, py: Python<'_>) -> Option<Constraints> {
+        let provider = self.provider.bind(py);
+        let Ok(has) = provider.hasattr("constraints") else {
+            return None;
+        };
+        if !has {
+            return None;
+        }
+
+        let Ok(value) = provider.call_method0("constraints") else {
+            return None;
+        };
+        if value.is_none() {
+            return None;
+        }
+
+        // A Python TableProvider can expose custom constraints metadata by
+        // returning a list of column indices (primary key) or a dict. The
+        // DataFusion trait requires a typed Constraints value, so we keep the
+        // conversion intentionally conservative.
+        Some(Constraints::empty())
+    }
+
+    fn python_table_type(&self, py: Python<'_>) -> TableType {
+        let provider = self.provider.bind(py);
+        let Ok(has) = provider.hasattr("table_type") else {
+            return TableType::Base;
+        };
+        if !has {
+            return TableType::Base;
+        }
+
+        let Ok(value) = provider.call_method0("table_type") else {
+            return TableType::Base;
+        };
+        match value.extract::<String>() {
+            Ok(name) => match name.trim().to_ascii_lowercase().as_str() {
+                "view" => TableType::View,
+                "temporary" => TableType::Temporary,
+                _ => TableType::Base,
+            },
+            Err(_) => TableType::Base,
+        }
+    }
+
+    fn python_get_table_definition(&self, py: Python<'_>) -> Option<String> {
+        let provider = self.provider.bind(py);
+        let Ok(has) = provider.hasattr("get_table_definition") else {
+            return None;
+        };
+        if !has {
+            return None;
+        }
+
+        let Ok(value) = provider.call_method0("get_table_definition") else {
+            return None;
+        };
+        if value.is_none() {
+            return None;
+        }
+
+        value.extract::<String>().ok()
+    }
+
+    fn python_statistics(&self, py: Python<'_>) -> Option<Statistics> {
+        let provider = self.provider.bind(py);
+        let Ok(has) = provider.hasattr("statistics") else {
+            return None;
+        };
+        if !has {
+            return None;
+        }
+
+        let Ok(value) = provider.call_method0("statistics") else {
+            return None;
+        };
+        if value.is_none() {
+            return None;
+        }
+
+        let schema = self.schema();
+        Some(Statistics::new_unknown(schema.as_ref()))
+    }
 }
 
 fn extract_rows(value: Bound<'_, PyAny>) -> PyResult<Vec<PyObject>> {
@@ -265,6 +409,14 @@ impl TableProvider for PythonTableProviderAdapter {
         self
     }
 
+    fn constraints(&self) -> Option<&Constraints> {
+        self.constraints
+            .get_or_init(|| {
+                Python::with_gil(|py| self.python_constraints(py))
+            })
+            .as_ref()
+    }
+
     fn schema(&self) -> SchemaRef {
         let schema = Python::with_gil(|py| self.python_schema(py).unwrap_or_else(|err| {
             panic!("Python schema conversion failed: {err}")
@@ -273,7 +425,16 @@ impl TableProvider for PythonTableProviderAdapter {
     }
 
     fn table_type(&self) -> TableType {
-        TableType::Base
+        *self
+            .table_type
+            .get_or_init(|| Python::with_gil(|py| self.python_table_type(py)))
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        let value = self
+            .table_definition
+            .get_or_init(|| Python::with_gil(|py| self.python_get_table_definition(py)));
+        value.as_deref()
     }
 
     fn supports_filters_pushdown(
@@ -284,6 +445,12 @@ impl TableProvider for PythonTableProviderAdapter {
             self.python_supports_filters_pushdown(py, filters)
                 .map_err(|err| DataFusionError::External(Box::new(err)))
         })
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.statistics
+            .get_or_init(|| Python::with_gil(|py| self.python_statistics(py)))
+            .clone()
     }
 
     async fn scan(

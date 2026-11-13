@@ -6,8 +6,11 @@ cd "$ROOT"
 
 source /opt/miniconda3/bin/activate astrofusion-2
 
-cargo build --release
-maturin build --release --strip --interpreter /opt/miniconda3/envs/astrofusion-2/bin/python
+# cargo build --release
+# maturin build --release --strip --interpreter /opt/miniconda3/envs/astrofusion-2/bin/python
+
+cargo build
+maturin build --strip --interpreter /opt/miniconda3/envs/astrofusion-2/bin/python
 
 mkdir -p build/python
 rm -rf build/python/*
